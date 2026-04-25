@@ -10,11 +10,14 @@ Slack ↔ Claude Code 연동 봇
    - "PR 요청해줘"                                → PR 생성
 """
 
+import logging
 import os
+import random
 import re
 import platform
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -39,6 +42,35 @@ TRIGGER_EMOJI = os.environ.get("TRIGGER_EMOJI", "eyes")
 
 # ── 진행 중 작업 추적 (thread_ts → [{repo, repo_path}, ...]) ─
 active_jobs: dict[str, list[dict]] = {}
+
+
+# ── 사용자 명령 로거 ─────────────────────────────────────
+_user_log = logging.getLogger("user_commands")
+_user_log.setLevel(logging.INFO)
+_user_log_handler = logging.FileHandler("user_commands.log", encoding="utf-8")
+_user_log_handler.setFormatter(logging.Formatter("%(message)s"))
+_user_log.addHandler(_user_log_handler)
+
+# 사용자 ID → 이름 캐시
+_user_name_cache: dict[str, str] = {}
+
+
+def _get_user_name(client, user_id: str) -> str:
+    if user_id in _user_name_cache:
+        return _user_name_cache[user_id]
+    try:
+        info = client.users_info(user=user_id)
+        name = info["user"]["real_name"] or info["user"]["name"]
+        _user_name_cache[user_id] = name
+        return name
+    except Exception:
+        return user_id
+
+
+def _log_command(client, user_id: str, command: str, detail: str):
+    name = _get_user_name(client, user_id)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _user_log.info(f"[{ts}] {name} ({user_id}) | {command} | {detail}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -149,10 +181,12 @@ def handle_reaction(event, client, logger):
     item    = event.get("item", {})
     channel = item.get("channel")
     msg_ts  = item.get("ts")
+    user_id = event.get("user", "unknown")
 
     if not channel or not msg_ts:
         return
 
+    _log_command(client, user_id, "emoji", f":{TRIGGER_EMOJI}: 반응")
     threading.Thread(
         target=_recommend_repos,
         args=(client, channel, msg_ts, "어디가 문제일까요?", logger),
@@ -172,6 +206,7 @@ def handle_message(event, client, logger):
     text      = event.get("text", "").strip()
     channel   = event.get("channel")
     thread_ts = event.get("thread_ts")
+    user_id   = event.get("user", "unknown")
 
     if not thread_ts:
         return
@@ -183,6 +218,7 @@ def handle_message(event, client, logger):
     if analyze_with_repo:
         repo_str    = analyze_with_repo.group(1).strip()
         instruction = analyze_with_repo.group(2).strip()
+        _log_command(client, user_id, "analyze", f"repo={repo_str} | {instruction}")
         threading.Thread(
             target=_do_analyze,
             args=(client, channel, thread_ts, repo_str, instruction, logger),
@@ -192,6 +228,7 @@ def handle_message(event, client, logger):
 
     if analyze_no_repo:
         instruction = analyze_no_repo.group(1).strip()
+        _log_command(client, user_id, "recommend", instruction)
         threading.Thread(
             target=_recommend_repos,
             args=(client, channel, thread_ts, instruction, logger),
@@ -204,6 +241,7 @@ def handle_message(event, client, logger):
     if fix_match:
         repo_str    = fix_match.group(1).strip()
         instruction = fix_match.group(2).strip()
+        _log_command(client, user_id, "fix", f"repo={repo_str} | {instruction}")
         threading.Thread(
             target=_do_fix_multi,
             args=(client, channel, thread_ts, repo_str, instruction, logger),
@@ -212,10 +250,16 @@ def handle_message(event, client, logger):
         return
 
     # ── PR 요청 ──
-    if re.search(r"pr\s*요청|pr\s*올려|pull\s*request", text, re.IGNORECASE):
+    # "PR 요청해줘 DWFLOW-XXX", "DWFLOW-XXX PR 요청해줘", "DWFLOW-XXX 으로 PR 요청해줘" 모두 지원
+    pr_match = re.search(r"pr\s*요청|pr\s*올려|pull\s*request", text, re.IGNORECASE)
+    if pr_match:
+        # 텍스트에서 브랜치명 패턴 추출 (DWFLOW-XXX, feature/xxx 등)
+        branch_search = re.search(r"([\w][\w./-]+[\w])", re.sub(r"(?:pr\s*요청\S*|pr\s*올려\S*|pull\s*request|으로|해줘|해주세요)", "", text, flags=re.IGNORECASE).strip())
+        branch_name = branch_search.group(1) if branch_search else None
+        _log_command(client, user_id, "pr", f"branch={branch_name or 'auto'}")
         threading.Thread(
             target=_create_pr,
-            args=(client, channel, thread_ts, logger),
+            args=(client, channel, thread_ts, branch_name, logger),
             daemon=True,
         ).start()
 
@@ -247,7 +291,9 @@ def _recommend_repos(client, channel, thread_ts, instruction, logger):
 - `repo-name`: 이유 한 줄
 
 ## 다음 단계
-analyze 또는 fix 명령어 예시를 알려주세요."""
+아래 형식의 명령어 예시만 안내해주세요 (다른 형식은 절대 사용하지 마세요):
+- `analyze: 레포명: 지시내용` — 코드 분석
+- `fix: 레포명: 지시내용` — 코드 수정"""
 
     try:
         result = run_claude(prompt, timeout=60, max_turns=1)
@@ -384,6 +430,21 @@ def _do_fix_multi(client, channel, thread_ts, repo_str, instruction, logger):
                 post_thread(client, channel, thread_ts, f"❌ `{repo_name}` 수정 실패:\n```{result.stderr[:500]}```")
                 continue
 
+            # fix로 수정된 파일 목록을 job에 기록
+            changed_files_result = subprocess.run(
+                ["git", "diff", "--name-only"],
+                cwd=str(repo_path),
+                capture_output=True, text=True,
+            )
+            untracked_files_result = subprocess.run(
+                ["git", "ls-files", "--others", "--exclude-standard"],
+                cwd=str(repo_path),
+                capture_output=True, text=True,
+            )
+            changed = [f for f in changed_files_result.stdout.strip().split("\n") if f]
+            untracked = [f for f in untracked_files_result.stdout.strip().split("\n") if f]
+            job["changed_files"] = changed + untracked
+
             _post_diff(client, channel, thread_ts, repo_path, repo_name, logger)
 
         except subprocess.TimeoutExpired:
@@ -446,28 +507,72 @@ def _post_diff(client, channel, thread_ts, repo_path, repo_name, logger):
 # PR 생성 (멀티 repo)
 # ══════════════════════════════════════════════════════════
 
-def _create_pr(client, channel, thread_ts, logger):
+def _generate_branch_name() -> str:
+    return f"DWFLOW-FIX-{random.randint(1000, 9999)}"
+
+
+def _create_pr(client, channel, thread_ts, branch_name, logger):
     jobs = active_jobs.get(thread_ts)
     if not jobs:
         post_thread(client, channel, thread_ts,
                     "❌ 연결된 작업을 찾을 수 없어요. `fix: repo_name: 지시내용` 먼저 실행해주세요.")
         return
 
+    # 브랜치명이 없으면 랜덤 생성
+    if not branch_name:
+        branch_name = _generate_branch_name()
+
+    all_success = True
     for job in jobs:
         repo_path = Path(job["repo_path"])
         repo_name = job["repo"]
 
-        post_thread(client, channel, thread_ts, f"🚀 `{repo_name}` PR 생성 중...")
+        post_thread(client, channel, thread_ts,
+                    f"🚀 `{repo_name}` PR 생성 중... (브랜치: `{branch_name}`, 타겟: `develop`)")
 
         try:
-            branch_result = subprocess.run(
-                ["git", "branch", "--show-current"],
+            # 1) fix에서 수정한 변경사항을 먼저 stash
+            subprocess.run(
+                ["git", "stash", "--include-untracked"],
                 cwd=str(repo_path),
                 capture_output=True, text=True,
             )
-            branch = branch_result.stdout.strip()
 
-            subprocess.run(["git", "add", "-A"], cwd=str(repo_path))
+            # 2) develop 최신화
+            subprocess.run(
+                ["git", "fetch", "origin", "develop"],
+                cwd=str(repo_path),
+                capture_output=True, text=True,
+            )
+
+            # 3) develop 기반으로 새 브랜치 생성
+            checkout_result = subprocess.run(
+                ["git", "checkout", "-b", branch_name, "origin/develop"],
+                cwd=str(repo_path),
+                capture_output=True, text=True,
+            )
+            if checkout_result.returncode != 0:
+                # 이미 존재하면 체크아웃만
+                subprocess.run(
+                    ["git", "checkout", branch_name],
+                    cwd=str(repo_path),
+                    capture_output=True, text=True,
+                )
+
+            # 4) stash에서 변경사항 복원
+            subprocess.run(
+                ["git", "stash", "pop"],
+                cwd=str(repo_path),
+                capture_output=True, text=True,
+            )
+
+            # 5) fix에서 수정한 파일들만 commit
+            changed_files = job.get("changed_files", [])
+            if not changed_files:
+                post_thread(client, channel, thread_ts,
+                            f"ℹ️ `{repo_name}` 변경된 파일이 없어 PR을 건너뜁니다.")
+                continue
+            subprocess.run(["git", "add", "--"] + changed_files, cwd=str(repo_path))
             subprocess.run(
                 ["git", "commit", "-m", f"fix: Claude Code 자동 수정 ({repo_name})"],
                 cwd=str(repo_path),
@@ -475,7 +580,7 @@ def _create_pr(client, channel, thread_ts, logger):
             )
 
             push_result = subprocess.run(
-                ["git", "push", "-u", "origin", branch],
+                ["git", "push", "-u", "origin", branch_name],
                 cwd=str(repo_path),
                 capture_output=True, text=True,
             )
@@ -485,7 +590,7 @@ def _create_pr(client, channel, thread_ts, logger):
                 continue
 
             pr_result = subprocess.run(
-                ["gh", "pr", "create", "--fill"],
+                ["gh", "pr", "create", "--base", "develop", "--fill"],
                 cwd=str(repo_path),
                 capture_output=True, text=True,
             )
@@ -493,15 +598,21 @@ def _create_pr(client, channel, thread_ts, logger):
             if pr_result.returncode == 0:
                 post_thread(client, channel, thread_ts,
                             f"✅ `{repo_name}` PR 생성 완료!\n{pr_result.stdout.strip()}")
+                all_success = True
             else:
                 post_thread(client, channel, thread_ts,
-                            f"❌ `{repo_name}` PR 생성 실패:\n```{pr_result.stderr[:500]}```")
+                            f"❌ `{repo_name}` PR 생성 실패:\n```{pr_result.stderr[:500]}```\n다시 `PR 요청해줘`로 재시도할 수 있어요.")
+                all_success = False
 
         except Exception as e:
             logger.error(f"PR 생성 오류: {e}")
-            post_thread(client, channel, thread_ts, f"❌ `{repo_name}` PR 생성 오류: {e}")
+            post_thread(client, channel, thread_ts,
+                        f"❌ `{repo_name}` PR 생성 오류: {e}\n다시 `PR 요청해줘`로 재시도할 수 있어요.")
+            all_success = False
 
-    active_jobs.pop(thread_ts, None)
+    # 모두 성공한 경우에만 작업 정보 제거
+    if all_success:
+        active_jobs.pop(thread_ts, None)
 
 
 # ══════════════════════════════════════════════════════════
