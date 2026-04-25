@@ -33,7 +33,7 @@ repos:
   attic-core-asset-messaging:
     description: "채팅 및 메시징 API를 제공하는 메시지 플랫폼"
     type: "backend"
-    domains: [채팅, 메시지, 스레드 대화, 토픽 관리, 애플리케이션 채널]
+    domains: [그룹 채널, 메시지, 스레드, 애플리케이션 채널]
     modules:
       messaging-component: "핵심 컴포넌트 (application, channel, chatting, thread, topic)"
       messaging-share: "공유 라이브러리"
@@ -98,7 +98,7 @@ repos:
   dworks-bizasset:
     description: "DWorks 핵심 비즈니스 에셋 (티켓, 사용자, 워크플로우 등 27개 컴포넌트)"
     type: "backend"
-    domains: [액션 로그, 애플리케이션, 인증, 비즈니스 폼, 센터, FAQ, 나이스베이스, 라이선스, 역할, 팀, 티켓, 사용자, 워크플로우]
+    domains: [액션 로그, 애플리케이션, 인증, 비즈니스 폼, 센터, FAQ, 지식, 라이선스, 역할, 팀, 티켓, 사용자, 워크플로우]
     modules:
       actionlog: "액션 로그"
       application: "애플리케이션"
@@ -106,7 +106,7 @@ repos:
       bizform: "비즈니스 폼"
       center: "센터 관리"
       faq: "FAQ"
-      knowledge: "나이스베이스"
+      knowledge: "지식"
       license: "라이선스"
       role: "역할"
       team: "팀"
@@ -117,11 +117,11 @@ repos:
   dworks-cstalk:
     description: "CS Talk 메인 서비스 (상담 톡, 배정, AI 에이전트 등 29개 컴포넌트)"
     type: "backend"
-    domains: [AI 에이전트, 답변 대기열, 승인, 배정, 자동 메시지, 봇 히스토리, FAQ 에이전트, 게스트, 회원, 수신, 번역, 화상톡, 대기 톡]
+    domains: [AI 에이전트, 답변 대기열, 승인, 배분, 자동 메시지, 봇 히스토리, FAQ 에이전트, 게스트, 회원, 수신, 번역, 화상톡, 대기 톡, 할일]
     modules:
       aiagent: "AI 에이전트"
       answerqueue: "답변 대기열"
-      assign: "배정"
+      assign: "배분"
       automessage: "자동 메시지"
       bothistory: "봇 히스토리"
       faqagent: "FAQ 에이전트"
@@ -132,11 +132,12 @@ repos:
       task: "작업"
       videotalk: "화상 톡"
       waitingtalk: "대기 톡"
+      work: "할일"
 
   dworks-insight:
     description: "Btalk 이벤트 수집/변환/통계 및 모니터링 모듈"
     type: "backend"
-    domains: [통계 수집, 데이터 변환, FAQ 모니터링, 티켓 분석, 사용자 활동, 워크 모니터링]
+    domains: [통계 수집, 데이터 변환, FAQ 모니터링, 티켓 분석, 사용자 활동, 할일 대시보드]
     modules:
       btalk-collector: "B톡 데이터 수집"
       btalk-statistics: "B톡 통계"
@@ -145,7 +146,7 @@ repos:
       faq-statistics: "FAQ 통계"
       ticket: "티켓 분석"
       useractivity: "사용자 활동"
-      work-monitor: "워크 모니터링"
+      work-monitor: "할일 대시보드"
 
   dworks-portal:
     description: "DWorks 포털 서비스 (Elasticsearch 기반 콘텐츠 관리/검색)"

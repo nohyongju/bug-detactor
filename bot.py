@@ -309,7 +309,7 @@ def _do_analyze(client, channel, thread_ts, repo_str, instruction, logger):
 
         try:
             logger.info(f"[analyze] 시작 repo_path={repo_path}")
-            result = run_claude(prompt, cwd=str(repo_path), timeout=300)
+            result = run_claude(prompt, cwd=str(repo_path), timeout=600, max_turns=50)
             logger.info(f"[analyze] returncode={result.returncode} stdout_len={len(result.stdout)} stderr={repr(result.stderr[:300])}")
 
             if result.returncode != 0:
