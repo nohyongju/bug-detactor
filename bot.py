@@ -4,15 +4,14 @@ Slack ↔ Claude Code 연동 봇
 [플로우]
 1. 품질팀이 채널에 이슈 메시지 작성
 2. 개발자가 스레드에 댓글:
-   - "analyze: 상세 지시"                        → repo 자동 추천
-   - "analyze: repo_name: 상세 지시"             → 해당 repo 코드 분석
-   - "fix: repo1, repo2: 상세 지시"              → 코드 수정 후 diff 전송 (멀티 repo 지원)
-   - "PR 요청해줘"                                → PR 생성
+   - "analyze: 상세 지시"                                → repo 자동 추천
+   - "analyze: repo_name: 상세 지시"                     → 해당 repo 코드 분석
+   - "fix: repo_name: 브랜치명: 상세 지시"               → 새 브랜치에서 코드 수정 + commit (멀티 repo 지원)
+   - "pr: repo_name"                                     → fix에서 만든 브랜치로 PR 생성
 """
 
 import logging
 import os
-import random
 import re
 import platform
 import subprocess
@@ -164,6 +163,18 @@ def run_claude(prompt: str, cwd: str = None, timeout: int = 300, max_turns: int 
     )
 
 
+PROTECTED_BRANCHES = {"main", "master", "develop"}
+
+
+def get_current_branch(repo_path: str | Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(repo_path),
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    return result.stdout.strip()
+
+
 def parse_repo_list(repo_str: str) -> list[str]:
     """'repo1, repo2' 또는 'repo1' → ['repo1', 'repo2']"""
     return [r.strip() for r in repo_str.split(",") if r.strip()]
@@ -236,32 +247,76 @@ def handle_message(event, client, logger):
         ).start()
         return
 
-    # ── fix: repo(s): 지시 ──
-    fix_match = re.match(r"fix\s*:\s*([^:]+)\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+    # ── fix: repo(s): 브랜치명: 지시 ──
+    fix_match = re.match(r"fix\s*:\s*([^:]+)\s*:\s*([^:]+)\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
     if fix_match:
         repo_str    = fix_match.group(1).strip()
-        instruction = fix_match.group(2).strip()
-        _log_command(client, user_id, "fix", f"repo={repo_str} | {instruction}")
+        branch_name = fix_match.group(2).strip()
+        instruction = fix_match.group(3).strip()
+        _log_command(client, user_id, "fix", f"repo={repo_str} | branch={branch_name} | {instruction}")
         threading.Thread(
             target=_do_fix_multi,
-            args=(client, channel, thread_ts, repo_str, instruction, logger),
+            args=(client, channel, thread_ts, repo_str, branch_name, instruction, logger),
             daemon=True,
         ).start()
         return
 
-    # ── PR 요청 ──
-    # "PR 요청해줘 DWFLOW-XXX", "DWFLOW-XXX PR 요청해줘", "DWFLOW-XXX 으로 PR 요청해줘" 모두 지원
-    pr_match = re.search(r"pr\s*요청|pr\s*올려|pull\s*request", text, re.IGNORECASE)
+    # ── pr: repo(s) ──
+    # "pr: repo_name" 또는 "pr: repo1, repo2"
+    pr_match = re.match(r"pr\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
     if pr_match:
-        # 텍스트에서 브랜치명 패턴 추출 (DWFLOW-XXX, feature/xxx 등)
-        branch_search = re.search(r"([\w][\w./-]+[\w])", re.sub(r"(?:pr\s*요청\S*|pr\s*올려\S*|pull\s*request|으로|해줘|해주세요)", "", text, flags=re.IGNORECASE).strip())
-        branch_name = branch_search.group(1) if branch_search else None
-        _log_command(client, user_id, "pr", f"branch={branch_name or 'auto'}")
+        repo_str = pr_match.group(1).strip()
+        _log_command(client, user_id, "pr", f"repo={repo_str}")
         threading.Thread(
             target=_create_pr,
-            args=(client, channel, thread_ts, branch_name, logger),
+            args=(client, channel, thread_ts, repo_str, logger),
             daemon=True,
         ).start()
+        return
+
+    # ── talk: 일반 대화 (자유 프롬프팅) ──
+    talk_match = re.match(r"talk\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+    if talk_match:
+        user_prompt = talk_match.group(1).strip()
+        _log_command(client, user_id, "talk", user_prompt[:100])
+        threading.Thread(
+            target=_do_talk,
+            args=(client, channel, thread_ts, user_prompt, logger),
+            daemon=True,
+        ).start()
+
+
+# ══════════════════════════════════════════════════════════
+# talk: 일반 대화 (자유 프롬프팅)
+# ══════════════════════════════════════════════════════════
+
+def _do_talk(client, channel, thread_ts, user_prompt, logger):
+    thread_context = get_thread_context(client, channel, thread_ts)
+
+    prompt = f"""아래 Slack 스레드의 대화 맥락과 사용자 질문을 참고하여 답변해주세요.
+
+[스레드 대화 내용]
+{thread_context}
+
+[사용자 질문]
+{user_prompt}
+
+자연스럽고 도움이 되는 답변을 한국어로 작성해주세요."""
+
+    post_thread(client, channel, thread_ts, "💬 답변 생성 중...")
+
+    try:
+        result = run_claude(prompt, timeout=120, max_turns=1)
+        if result.returncode == 0 and result.stdout.strip():
+            post_thread(client, channel, thread_ts, result.stdout.strip())
+        else:
+            post_thread(client, channel, thread_ts,
+                        f"❌ 답변 생성 실패:\n```{result.stderr[:500]}```")
+    except subprocess.TimeoutExpired:
+        post_thread(client, channel, thread_ts, "⏰ 답변 생성 시간 초과 (2분).")
+    except Exception as e:
+        logger.error(f"talk 오류: {e}")
+        post_thread(client, channel, thread_ts, f"❌ 오류 발생: {e}")
 
 
 # ══════════════════════════════════════════════════════════
@@ -293,7 +348,7 @@ def _recommend_repos(client, channel, thread_ts, instruction, logger):
 ## 다음 단계
 아래 형식의 명령어 예시만 안내해주세요 (다른 형식은 절대 사용하지 마세요):
 - `analyze: 레포명: 지시내용` — 코드 분석
-- `fix: 레포명: 지시내용` — 코드 수정"""
+- `fix: 레포명: 브랜치명: 지시내용` — 새 브랜치에서 코드 수정"""
 
     try:
         result = run_claude(prompt, timeout=60, max_turns=1)
@@ -377,14 +432,14 @@ def _do_analyze(client, channel, thread_ts, repo_str, instruction, logger):
 
     repo_list = ", ".join(repo_names)
     post_thread(client, channel, thread_ts,
-                f"수정을 시작하려면 `fix: {repo_list}: <지시내용>` 을 입력해주세요.")
+                f"수정을 시작하려면 `fix: {repo_list}: 브랜치명: <지시내용>` 을 입력해주세요.")
 
 
 # ══════════════════════════════════════════════════════════
 # fix: 코드 수정 + diff 전송 (멀티 repo)
 # ══════════════════════════════════════════════════════════
 
-def _do_fix_multi(client, channel, thread_ts, repo_str, instruction, logger):
+def _do_fix_multi(client, channel, thread_ts, repo_str, branch_name, instruction, logger):
     repo_names = parse_repo_list(repo_str)
     issue_text = get_thread_context(client, channel, thread_ts)
 
@@ -406,9 +461,44 @@ def _do_fix_multi(client, channel, thread_ts, repo_str, instruction, logger):
         repo_name = job["repo"]
         repo_path = Path(job["repo_path"])
 
-        post_thread(client, channel, thread_ts, f"⚙️ `{repo_name}` 코드 수정 중...")
+        try:
+            # 1) develop 최신화
+            subprocess.run(
+                ["git", "fetch", "origin", "develop"],
+                cwd=str(repo_path),
+                capture_output=True, text=True, encoding="utf-8",
+            )
 
-        prompt = f"""아래 품질팀 이슈와 개발자 지시를 바탕으로 코드를 수정해주세요.
+            # 2) develop 기반으로 새 브랜치 생성
+            checkout_result = subprocess.run(
+                ["git", "checkout", "-b", branch_name, "origin/develop"],
+                cwd=str(repo_path),
+                capture_output=True, text=True, encoding="utf-8",
+            )
+            if checkout_result.returncode != 0:
+                # 이미 존재하면 체크아웃만
+                checkout_result = subprocess.run(
+                    ["git", "checkout", branch_name],
+                    cwd=str(repo_path),
+                    capture_output=True, text=True, encoding="utf-8",
+                )
+                if checkout_result.returncode != 0:
+                    post_thread(client, channel, thread_ts,
+                                f"❌ `{repo_name}` 브랜치 `{branch_name}` 체크아웃 실패:\n```{checkout_result.stderr[:500]}```")
+                    continue
+
+            # 브랜치 안전 검증
+            actual_branch = get_current_branch(repo_path)
+            if actual_branch in PROTECTED_BRANCHES:
+                post_thread(client, channel, thread_ts,
+                            f"❌ `{repo_name}` 현재 브랜치가 `{actual_branch}`입니다. "
+                            f"보호 브랜치에서는 작업할 수 없어요.")
+                continue
+
+            post_thread(client, channel, thread_ts,
+                        f"⚙️ `{repo_name}` 코드 수정 중... (브랜치: `{branch_name}`)")
+
+            prompt = f"""아래 품질팀 이슈와 개발자 지시를 바탕으로 코드를 수정해주세요.
 개발자 지시에 언급된 경로/키워드 관련 파일만 탐색하세요. 전체 repo를 탐색하지 마세요.
 
 [품질팀 이슈]
@@ -422,7 +512,6 @@ def _do_fix_multi(client, channel, thread_ts, repo_str, instruction, logger):
 - 변경 범위를 최소화해주세요
 - 테스트가 있다면 함께 수정해주세요"""
 
-        try:
             result = run_claude(prompt, cwd=str(repo_path), timeout=300)
             logger.info(f"[fix] {repo_name} returncode={result.returncode}")
 
@@ -430,22 +519,39 @@ def _do_fix_multi(client, channel, thread_ts, repo_str, instruction, logger):
                 post_thread(client, channel, thread_ts, f"❌ `{repo_name}` 수정 실패:\n```{result.stderr[:500]}```")
                 continue
 
-            # fix로 수정된 파일 목록을 job에 기록
+            # 수정된 파일 목록 기록
             changed_files_result = subprocess.run(
                 ["git", "diff", "--name-only"],
                 cwd=str(repo_path),
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8",
             )
             untracked_files_result = subprocess.run(
                 ["git", "ls-files", "--others", "--exclude-standard"],
                 cwd=str(repo_path),
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8",
             )
             changed = [f for f in changed_files_result.stdout.strip().split("\n") if f]
             untracked = [f for f in untracked_files_result.stdout.strip().split("\n") if f]
-            job["changed_files"] = changed + untracked
+            all_changed = changed + untracked
+            job["changed_files"] = all_changed
+            job["branch_name"] = branch_name
 
+            if not all_changed:
+                post_thread(client, channel, thread_ts,
+                            f"ℹ️ `{repo_name}` 변경된 파일이 없어요.")
+                continue
+
+            # diff 전송
             _post_diff(client, channel, thread_ts, repo_path, repo_name, logger)
+
+            # commit
+            subprocess.run(["git", "add", "--"] + all_changed,
+                           cwd=str(repo_path), capture_output=True, text=True, encoding="utf-8")
+            subprocess.run(
+                ["git", "commit", "-m", f"fix: Claude Code 자동 수정 ({repo_name})"],
+                cwd=str(repo_path),
+                capture_output=True, text=True, encoding="utf-8",
+            )
 
         except subprocess.TimeoutExpired:
             post_thread(client, channel, thread_ts, f"⏰ `{repo_name}` 작업 시간 초과 (5분).")
@@ -453,7 +559,9 @@ def _do_fix_multi(client, channel, thread_ts, repo_str, instruction, logger):
             logger.error(f"fix 오류: {e}")
             post_thread(client, channel, thread_ts, f"❌ `{repo_name}` 오류 발생: {e}")
 
-    post_thread(client, channel, thread_ts, "PR을 올리려면 `PR 요청해줘` 라고 입력해주세요 🚀")
+    repo_list = ", ".join(repo_names)
+    post_thread(client, channel, thread_ts,
+                f"PR을 올리려면 `pr: {repo_list}` 을 입력해주세요 🚀")
 
 
 # ══════════════════════════════════════════════════════════
@@ -465,7 +573,7 @@ def _post_diff(client, channel, thread_ts, repo_path, repo_name, logger):
         stat_result = subprocess.run(
             ["git", "diff", "--stat"],
             cwd=str(repo_path),
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
         )
 
         if not stat_result.stdout.strip():
@@ -478,7 +586,7 @@ def _post_diff(client, channel, thread_ts, repo_path, repo_name, logger):
         files_result = subprocess.run(
             ["git", "diff", "--name-only"],
             cwd=str(repo_path),
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
         )
 
         for file_path in files_result.stdout.strip().split("\n"):
@@ -487,7 +595,7 @@ def _post_diff(client, channel, thread_ts, repo_path, repo_name, logger):
             file_diff = subprocess.run(
                 ["git", "diff", "--", file_path],
                 cwd=str(repo_path),
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8",
             )
             diff_text = file_diff.stdout
             if not diff_text:
@@ -507,107 +615,139 @@ def _post_diff(client, channel, thread_ts, repo_path, repo_name, logger):
 # PR 생성 (멀티 repo)
 # ══════════════════════════════════════════════════════════
 
-def _generate_branch_name() -> str:
-    return f"DWFLOW-FIX-{random.randint(1000, 9999)}"
+def _generate_pr_description(client, channel, thread_ts, repo_name, changed_files, logger) -> dict:
+    """스레드 컨텍스트를 기반으로 Claude가 PR title과 description을 생성"""
+    thread_context = get_thread_context(client, channel, thread_ts)
+    files_str = "\n".join(changed_files) if changed_files else "(없음)"
+
+    prompt = f"""아래 Slack 스레드 대화 내용을 바탕으로 GitHub PR의 title과 body를 작성해주세요.
+
+[스레드 대화 내용]
+{thread_context}
+
+[대상 레포지토리]
+{repo_name}
+
+[변경된 파일 목록]
+{files_str}
+
+다음 형식으로 **정확히** 작성해주세요 (구분자 `---` 를 반드시 포함):
+
+TITLE:
+(한 줄 PR 제목, 예: fix: OOO 버그 수정)
+---
+BODY:
+## 🐛 버그 내용
+(어떤 버그/이슈가 있었는지 요약)
+
+## 🔧 수정 사항
+(무엇을 어떻게 수정했는지, 변경된 파일과 핵심 변경 포인트)
+
+## 📝 리뷰 포인트
+(리뷰어가 특히 확인해야 할 사항, 사이드이펙트 가능성 등)
+
+주의: 마크다운 형식을 유지하고, 스레드 대화에서 파악한 실제 내용을 기반으로 구체적으로 작성해주세요."""
+
+    try:
+        result = run_claude(prompt, timeout=60, max_turns=1)
+        if result.returncode == 0 and result.stdout.strip():
+            output = result.stdout.strip()
+            if "---" in output:
+                parts = output.split("---", 1)
+                title_part = parts[0].strip()
+                body_part = parts[1].strip()
+                # TITLE: 접두사 제거
+                title = title_part.replace("TITLE:", "").strip().split("\n")[0].strip()
+                # BODY: 접두사 제거
+                body = body_part.replace("BODY:", "", 1).strip()
+                return {"title": title, "body": body}
+        logger.warning(f"PR description 생성 실패, 기본값 사용: {result.stderr[:200]}")
+    except Exception as e:
+        logger.warning(f"PR description 생성 오류, 기본값 사용: {e}")
+
+    # fallback: Claude 생성 실패 시 기본값 반환
+    return {
+        "title": f"fix: Claude Code 자동 수정 ({repo_name})",
+        "body": "Claude Code에 의해 자동 생성된 PR입니다."
+    }
 
 
-def _create_pr(client, channel, thread_ts, branch_name, logger):
-    jobs = active_jobs.get(thread_ts)
-    if not jobs:
+def _create_pr(client, channel, thread_ts, repo_str, logger):
+    all_jobs = active_jobs.get(thread_ts)
+    if not all_jobs:
         post_thread(client, channel, thread_ts,
-                    "❌ 연결된 작업을 찾을 수 없어요. `fix: repo_name: 지시내용` 먼저 실행해주세요.")
+                    "❌ 연결된 작업을 찾을 수 없어요. `fix: repo_name: 브랜치명: 지시내용` 먼저 실행해주세요.")
         return
 
-    # 브랜치명이 없으면 랜덤 생성
-    if not branch_name:
-        branch_name = _generate_branch_name()
+    # 요청된 repo만 필터링
+    requested_repos = parse_repo_list(repo_str)
+    jobs = [j for j in all_jobs if j["repo"] in requested_repos]
+
+    if not jobs:
+        available = ", ".join(j["repo"] for j in all_jobs)
+        post_thread(client, channel, thread_ts,
+                    f"❌ `{repo_str}`에 해당하는 작업을 찾을 수 없어요.\n현재 작업된 레포: `{available}`")
+        return
 
     all_success = True
     for job in jobs:
         repo_path = Path(job["repo_path"])
         repo_name = job["repo"]
+        branch_name = job.get("branch_name")
+
+        if not branch_name:
+            post_thread(client, channel, thread_ts,
+                        f"❌ `{repo_name}` 브랜치 정보가 없어요. `fix:` 를 다시 실행해주세요.")
+            all_success = False
+            continue
 
         post_thread(client, channel, thread_ts,
-                    f"🚀 `{repo_name}` PR 생성 중... (브랜치: `{branch_name}`, 타겟: `develop`)")
+                    f"🚀 `{repo_name}` PR 생성 중... (브랜치: `{branch_name}` → `develop`)")
 
         try:
-            # 1) fix에서 수정한 변경사항을 먼저 stash
-            subprocess.run(
-                ["git", "stash", "--include-untracked"],
-                cwd=str(repo_path),
-                capture_output=True, text=True,
-            )
-
-            # 2) develop 최신화
-            subprocess.run(
-                ["git", "fetch", "origin", "develop"],
-                cwd=str(repo_path),
-                capture_output=True, text=True,
-            )
-
-            # 3) develop 기반으로 새 브랜치 생성
-            checkout_result = subprocess.run(
-                ["git", "checkout", "-b", branch_name, "origin/develop"],
-                cwd=str(repo_path),
-                capture_output=True, text=True,
-            )
-            if checkout_result.returncode != 0:
-                # 이미 존재하면 체크아웃만
-                subprocess.run(
-                    ["git", "checkout", branch_name],
-                    cwd=str(repo_path),
-                    capture_output=True, text=True,
-                )
-
-            # 4) stash에서 변경사항 복원
-            subprocess.run(
-                ["git", "stash", "pop"],
-                cwd=str(repo_path),
-                capture_output=True, text=True,
-            )
-
-            # 5) fix에서 수정한 파일들만 commit
-            changed_files = job.get("changed_files", [])
-            if not changed_files:
+            # 보호 브랜치 안전 검증
+            actual_branch = get_current_branch(repo_path)
+            if actual_branch in PROTECTED_BRANCHES:
                 post_thread(client, channel, thread_ts,
-                            f"ℹ️ `{repo_name}` 변경된 파일이 없어 PR을 건너뜁니다.")
+                            f"❌ `{repo_name}` 현재 브랜치가 `{actual_branch}`입니다. "
+                            f"보호 브랜치에 직접 push할 수 없어요.")
+                all_success = False
                 continue
-            subprocess.run(["git", "add", "--"] + changed_files, cwd=str(repo_path))
-            subprocess.run(
-                ["git", "commit", "-m", f"fix: Claude Code 자동 수정 ({repo_name})"],
-                cwd=str(repo_path),
-                capture_output=True,
-            )
 
             push_result = subprocess.run(
                 ["git", "push", "-u", "origin", branch_name],
                 cwd=str(repo_path),
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8",
             )
             if push_result.returncode != 0:
                 post_thread(client, channel, thread_ts,
                             f"❌ `{repo_name}` push 실패:\n```{push_result.stderr[:500]}```")
+                all_success = False
                 continue
 
+            # PR description 생성
+            changed_files = job.get("changed_files", [])
+            pr_info = _generate_pr_description(client, channel, thread_ts, repo_name, changed_files, logger)
+
             pr_result = subprocess.run(
-                ["gh", "pr", "create", "--base", "develop", "--fill"],
+                ["gh", "pr", "create", "--base", "develop",
+                 "--title", pr_info["title"], "--body", pr_info["body"]],
                 cwd=str(repo_path),
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8",
             )
 
             if pr_result.returncode == 0:
                 post_thread(client, channel, thread_ts,
                             f"✅ `{repo_name}` PR 생성 완료!\n{pr_result.stdout.strip()}")
-                all_success = True
             else:
                 post_thread(client, channel, thread_ts,
-                            f"❌ `{repo_name}` PR 생성 실패:\n```{pr_result.stderr[:500]}```\n다시 `PR 요청해줘`로 재시도할 수 있어요.")
+                            f"❌ `{repo_name}` PR 생성 실패:\n```{pr_result.stderr[:500]}```\n`pr: {repo_name}` 으로 재시도할 수 있어요.")
                 all_success = False
 
         except Exception as e:
             logger.error(f"PR 생성 오류: {e}")
             post_thread(client, channel, thread_ts,
-                        f"❌ `{repo_name}` PR 생성 오류: {e}\n다시 `PR 요청해줘`로 재시도할 수 있어요.")
+                        f"❌ `{repo_name}` PR 생성 오류: {e}\n`pr: {repo_name}` 으로 재시도할 수 있어요.")
             all_success = False
 
     # 모두 성공한 경우에만 작업 정보 제거
